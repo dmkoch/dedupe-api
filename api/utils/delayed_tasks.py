@@ -8,16 +8,17 @@ from api.app_config import DB_CONN, DOWNLOAD_FOLDER
 from api.models import DedupeSession, User, entity_map
 from api.database import worker_session
 from api.utils.helpers import preProcess, clusterGen, \
-    makeSampleDict, windowed_query, getDistinct
+    makeSampleDict, windowed_query, getDistinct, getMatches, convertTraining
 from api.utils.db_functions import updateEntityMap, writeBlockingMap, \
     writeRawTable, initializeEntityMap, writeProcessedTable, writeCanonRep, \
-    addRowHash
+    addRowHash, addToEntityMap
 from api.utils.review_machine import ReviewMachine
 from sqlalchemy import Table, MetaData, Column, String, func, text
 from sqlalchemy.sql import label
 from sqlalchemy.exc import NoSuchTableError, ProgrammingError
 from itertools import groupby
 from operator import itemgetter
+from collections import OrderedDict
 from csvkit import convert
 from csvkit.unicsv import UnicodeCSVDictReader, UnicodeCSVReader, \
     UnicodeCSVWriter
@@ -138,7 +139,7 @@ def bulkMarkCanonClusters(session_id, user=None):
 @queuefunc
 def getMatchingReady(session_id):
     addRowHash(session_id)
-    # cleanupTables(session_id)
+    cleanupTables(session_id)
     engine = worker_session.bind
     with engine.begin() as conn:
         conn.execute('DROP TABLE IF EXISTS "match_blocks_{0}"'\
@@ -155,19 +156,8 @@ def getMatchingReady(session_id):
     # Save Gazetteer settings
     d = dedupe.Gazetteer(field_defs)
     
-    # Disabling canopy based predicates for now
-    while True:
-        ids = []
-        for i, definition in enumerate(d.data_model.primary_fields):
-            for idx, predicate in enumerate(definition.predicates):
-                if hasattr(predicate, 'index'):
-                    ids.append((i, idx,))
-                    del d.data_model.primary_fields[i].predicates[idx]
-        if not ids:
-            break
-
     d.readTraining(StringIO(sess.training_data))
-    d.train()
+    d.train(ppc=0.1, index_predicates=False)
     g_settings = StringIO()
     d.writeSettings(g_settings)
     g_settings.seek(0)
@@ -177,7 +167,8 @@ def getMatchingReady(session_id):
 
     for field in d.blocker.index_fields:
         fd = (unicode(f[0]) for f in \
-                engine.execute('select distinct {0} from "processed_{1}"'.format(field, session_id)))
+                engine.execute('select distinct {0} from "processed_{1}"'\
+                    .format(field, session_id)))
         d.blocker.index(fd, field)
     
     # Write match_block table
@@ -234,12 +225,145 @@ def getMatchingReady(session_id):
         ON p.record_id = e.record_id
       WHERE e.record_id IS NULL
     '''.format(session_id)
-    count = list(engine.execute(sel))
+    count = engine.execute(sel).first()
     sess.status = 'matching ready'
-    sess.review_count = count[0][0]
+    sess.review_count = count[0]
     worker_session.add(sess)
     worker_session.commit()
+    create_human_review = '''
+        CREATE TABLE "match_review_{0}" AS
+          SELECT
+            r.record_id,
+            ARRAY[]::varchar[] AS entities,
+            FALSE AS reviewed, 
+            ARRAY[]::double precision[] AS confidence,
+            NULL::varchar AS reviewer
+          FROM "raw_{0}" AS r
+          LEFT JOIN "entity_{0}" AS e
+            ON r.record_id = e.record_id
+          WHERE e.record_id IS NULL
+    '''.format(session_id)
+    with engine.begin() as conn:
+        conn.execute('DROP TABLE IF EXISTS "match_review_{0}"'.format(session_id))
+        conn.execute(create_human_review)
+        conn.execute('CREATE INDEX "match_rev_idx_{0}" ON "match_review_{0}" (record_id)'.format(session_id))
+    populateHumanReview(session_id)
     return None
+
+@queuefunc
+def populateHumanReview(session_id):
+    dedupe_session = worker_session.query(DedupeSession).get(session_id)
+    dedupe_session.processing = True
+    worker_session.add(dedupe_session)
+    worker_session.commit()
+    
+    engine = worker_session.bind
+    
+
+    queue_count = ''' 
+        SELECT count(*) FROM "match_review_{0}"  
+          WHERE array_upper(entities, 1) IS NOT NULL
+            AND reviewed = FALSE
+    '''.format(session_id)
+    queue_count = engine.execute(queue_count).first()[0]
+    limit = 21 - queue_count
+    
+    raw_fields = sorted(list(set([f['field'] \
+            for f in json.loads(dedupe_session.field_defs)])))
+    raw_fields.append('record_id')
+    fields = ', '.join(['r.{0}'.format(f) for f in raw_fields])
+    sel = ''' 
+      SELECT {0}
+      FROM "processed_{1}" as r
+      LEFT JOIN "entity_{1}" as e
+        ON r.record_id = e.record_id
+      WHERE e.record_id IS NULL
+    '''.format(fields, session_id)
+    rows = (OrderedDict(zip(raw_fields, r)) for r in engine.execute(text(sel)))
+    human_queue = []
+    cleared = []
+    
+    while len(human_queue) < limit:
+        try:
+            record = rows.next()
+        except StopIteration:
+            break
+        matches = getMatches(session_id, record)
+        if len(matches) == 1 and matches[0]['confidence'] >= 0.8:
+                addToEntityMap(session_id, 
+                               record, 
+                               match_ids=[m['record_id'] for m in matches],
+                               reviewer='machine')
+                cleared.append(record['record_id'])
+        elif len(matches) == 0:
+            addToEntityMap(session_id, 
+                           record, 
+                           reviewer='machine')
+            cleared.append(record['record_id'])
+
+        else:
+            # check if any of the matches are low confidence
+            for idx, match in enumerate(matches):
+                if match['confidence'] < 0.2:
+                    matches.pop(idx)
+            
+            if len(matches):
+                r = {
+                    'record_id': record['record_id'], 
+                    'entities': [m['entity_id'] for m in matches],
+                    'confidence': [m['confidence'] for m in matches]
+                    }
+                upd = ''' 
+                    UPDATE "match_review_{0}" SET
+                      entities = :entities,
+                      confidence = :confidence
+                    WHERE record_id = :record_id
+                '''.format(session_id)
+                with engine.begin() as conn:
+                    conn.execute(text(upd), **r)
+            else:
+                addToEntityMap(session_id, 
+                               record, 
+                               reviewer='machine')
+                cleared.append(record['record_id'])
+
+    reviewed = ''' 
+        UPDATE "match_review_{0}" SET 
+        reviewed = TRUE,
+        reviewer = :reviewer
+        WHERE record_id IN :ids
+    '''.format(session_id)
+    with engine.begin() as conn:
+        if cleared:
+            conn.execute(text(reviewed), ids=tuple(cleared), reviewer='machine')
+    
+    # Calculate running average for review count
+    worker_session.refresh(dedupe_session)
+    
+    total_reviewed = ''' 
+        SELECT count(*) 
+        FROM "match_review_{0}"
+        WHERE reviewed = TRUE
+    '''.format(session_id)
+    total_reviewed = engine.execute(text(total_reviewed)).first()[0]
+    human_count = ''' 
+        SELECT count(*) 
+        FROM "match_review_{0}"
+        WHERE reviewer != :reviewer
+            AND reviewed = TRUE
+    '''.format(session_id)
+    human_count = engine.execute(text(human_count), reviewer='machine').first()[0]
+    remaining_count = ''' 
+        SELECT count(*)
+        FROM "match_review_{0}"
+        WHERE reviewed = FALSE
+    '''.format(session_id)
+    remaining_count = engine.execute(text(remaining_count)).first()[0]
+    review_prop = (human_count + 0.001) / (total_reviewed + 0.001)
+    dedupe_session.review_count = remaining_count * review_prop
+    dedupe_session.processing = False
+    worker_session.add(dedupe_session)
+    worker_session.commit()
 
 @queuefunc
 def cleanupTables(session_id, tables=None):
@@ -306,7 +430,7 @@ def initializeModel(session_id, init=True):
     worker_session.expire_all()
     sess = worker_session.query(DedupeSession).get(session_id)
     while True:
-        worker_session.refresh(sess, ['field_defs', 'sample'])
+        worker_session.refresh(sess, ['field_defs', 'sample', 'record_count'])
         if not sess.field_defs: # pragma: no cover
             time.sleep(3)
         else:
@@ -316,12 +440,14 @@ def initializeModel(session_id, init=True):
                 writeProcessedTable(session_id)
             updated_fds = []
             for field in field_defs:
+                distinct_vals = getDistinct(field['field'], session_id)
                 if field['type'] == 'Categorical':
-                    categories = getDistinct(field['field'], session_id)
-                    if len(categories) <= 6:
-                        field.update({'categories': categories})
+                    if len(distinct_vals) <= 6:
+                        field.update({'categories': distinct_vals})
                     else:
                         field['type'] = 'Exact'
+                if len(distinct_vals) < sess.record_count:
+                    field.update({'has_missing': True})
                 updated_fds.append(field)
             sess.field_defs = json.dumps(updated_fds)
             sess.status = 'model defined'
@@ -338,14 +464,18 @@ def trainDedupe(session_id):
     dd_session = worker_session.query(DedupeSession)\
         .get(session_id)
     data_sample = cPickle.loads(dd_session.sample)
-    deduper = dedupe.Dedupe(json.loads(dd_session.field_defs), 
-        data_sample=data_sample)
-    training_data = StringIO(dd_session.training_data)
+    field_defs = json.loads(dd_session.field_defs)
+    training_data = json.loads(dd_session.training_data)
+    training_data = convertTraining(field_defs, training_data)
+    deduper = dedupe.Dedupe(field_defs, data_sample=data_sample)
+    training_data = StringIO(json.dumps(training_data))
     deduper.readTraining(training_data)
     deduper.train()
     settings_file_obj = StringIO()
     deduper.writeSettings(settings_file_obj)
     dd_session.settings_file = settings_file_obj.getvalue()
+    training_data.seek(0)
+    dd_session.training_data = training_data.getvalue()
     worker_session.add(dd_session)
     worker_session.commit()
     deduper.cleanupTraining()
@@ -455,6 +585,20 @@ def reDedupeCanon(session_id, threshold=0.25):
     last_update = datetime.now().replace(tzinfo=TIME_ZONE)
     with engine.begin() as c:
         c.execute(upd, last_update=last_update)
+    delete = ''' 
+        DELETE FROM "entity_{0}" 
+        WHERE record_id IN (
+            SELECT record_id
+            FROM "match_review_{0}"
+        )
+    '''.format(session_id)
+    conn = engine.connect()
+    trans = conn.begin()
+    try:
+        conn.execute(delete)
+        trans.commit()
+    except Exception:
+        trans.rollback()
     dedupeCanon(session_id, threshold=threshold)
     sess = worker_session.query(DedupeSession).get(session_id)
     sess.status = 'canon clustered'
@@ -563,7 +707,6 @@ def dedupeCanon(session_id, threshold=0.25):
     else: # pragma: no cover
         print 'did not find clusters'
         getMatchingReady(session_id)
-        dd.processing = False
     review_count = worker_session.query(entity_table.c.entity_id.distinct())\
         .filter(entity_table.c.clustered == False)\
         .count()

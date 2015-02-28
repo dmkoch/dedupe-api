@@ -339,7 +339,7 @@ def review():
         if row.field_defs:
             d['field_defs'] = json.loads(unicode(row.field_defs))
         d['status_info'] = [i.copy() for i in STATUS_LIST if i['machine_name'] == row.status][0]
-        d['status_info']['next_step'] = d['status_info']['next_step'].format(row.id)
+        d['status_info']['next_step_url'] = d['status_info']['next_step_url'].format(row.id)
         if row.last_work_status:
             d['last_work_status'] = unicode(row.last_work_status)
         all_sessions.append(d)
@@ -386,6 +386,10 @@ def rewind():
     session_id = flask_session['session_id']
     step = request.args.get('step')
     threshold = request.args.get('threshold')
+    dedupe_session = db_session.query(DedupeSession).get(session_id)
+    dedupe_session.processing = True
+    db_session.add(dedupe_session)
+    db_session.commit()
     if step == 'first':
         reDedupeRaw.delay(session_id, threshold=float(threshold))
     if step == 'second':

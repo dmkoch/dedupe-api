@@ -17,7 +17,8 @@ import dedupe
 from api.utils.delayed_tasks import dedupeRaw, initializeSession, \
     initializeModel
 from api.utils.db_functions import writeRawTable
-from api.utils.helpers import getDistinct, slugify, STATUS_LIST, updateTraining
+from api.utils.helpers import getDistinct, slugify, STATUS_LIST, \
+    updateTraining, convertTraining
 from api.models import DedupeSession, User, Group, WorkTable
 from api.database import app_session as db_session, init_engine
 from api.auth import check_roles, csrf, login_required, check_sessions
@@ -77,13 +78,14 @@ def upload():
         filename=f.filename,
         group=group,
         status=STATUS_LIST[0]['machine_name'])
-    db_session.add(sess)
-    db_session.commit()
     u.seek(0)
     with open('/tmp/%s_raw.csv' % session_id, 'wb') as s:
         s.write(u.getvalue())
     del u
     del reader
+    sess.processing = True
+    db_session.add(sess)
+    db_session.commit()
     initializeSession.delay(session_id)
     flask_session['session_id'] = session_id
     return jsonify(ready=True, session_id=session_id)
@@ -183,11 +185,7 @@ def select_fields():
 @login_required
 @check_roles(roles=['admin'])
 def select_field_types():
-    dedupe_session = db_session.query(DedupeSession.name, 
-                                      DedupeSession.id, 
-                                      DedupeSession.field_defs)\
-            .filter(DedupeSession.id == flask_session['session_id'])\
-            .first()
+    dedupe_session = db_session.query(DedupeSession).get(flask_session['session_id'])
     errors = db_session.query(WorkTable)\
             .filter(WorkTable.session_id == dedupe_session.id)\
             .filter(WorkTable.cleared == False)\
@@ -203,17 +201,10 @@ def select_field_types():
         ftypes = sorted(form.items())
         for k,g in groupby(ftypes, key=lambda x: x[0].rsplit('_', 1)[0]):
             vals = list(g)
-            has_missing = False
-            for ftype, val in vals:
-                if ftype == '{0}_missing'.format(k):
-                    has_missing = True
             fs = []
             for field, val in vals:
                 fs.extend([{'field': k, 'type': val[i]} \
                     for i in range(len(val)) if field.endswith('type')])
-            for f in fs:
-                if has_missing:
-                    f.update({'has_missing': True})
             field_defs.extend(fs)
         engine = db_session.bind
         with engine.begin() as conn:
@@ -223,6 +214,9 @@ def select_field_types():
                 WHERE id = :id
             '''), field_defs=json.dumps(field_defs), id=dedupe_session.id)
         if not errors:
+            dedupe_session.processing = True
+            db_session.add(dedupe_session)
+            db_session.commit()
             initializeModel.delay(dedupe_session.id)
         return redirect(url_for('trainer.training_run'))
     return render_template('dedupe_session/select_field_types.html', 
@@ -335,6 +329,9 @@ def mark_pair():
         counter['no'] += 1
         resp = {'counter': counter}
     elif action == 'finish':
+        sess.processing = True
+        db_session.add(sess)
+        db_session.commit()
         dedupeRaw.delay(flask_session['session_id'])
         resp = {'finished': True}
         flask_session['dedupe_start'] = time.time()
@@ -344,7 +341,11 @@ def mark_pair():
         resp = {'counter': counter}
     db_session.refresh(sess, ['training_data'])
     labels = json.loads(sess.training_data)
-    deduper.markPairs(labels)
+    try:
+        deduper.markPairs(labels)
+    except TypeError:
+        td = convertTraining(field_defs, labels)
+        deduper.markPairs(td)
     if resp.get('finished'):
         del flask_session['deduper']
     resp = make_response(json.dumps(resp))

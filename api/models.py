@@ -22,7 +22,7 @@ def entity_map(name, metadata, record_id_type=BigInteger):
                 server_default=text('CURRENT_TIMESTAMP')),
         Column('last_update', DateTime(timezone=True)),
         Column('match_type', String),
-        Column('record_id', record_id_type, index=True),
+        Column('record_id', record_id_type, unique=True, index=True),
         Column('target_record_id', record_id_type),
         Column('confidence', Float(precision=50)),
         Column('source_hash', String(32)),
@@ -95,7 +95,7 @@ class DedupeSession(Base):
         if self.field_defs:
             d['field_defs'] = json.loads(self.field_defs)
         d['status_info'] = [i.copy() for i in STATUS_LIST if i['machine_name'] == self.status][0]
-        d['status_info']['next_step'] = d['status_info']['next_step'].format(self.id)
+        d['status_info']['next_step_url'] = d['status_info']['next_step_url'].format(self.id)
         return d
 
 roles_users = Table('role_users', Base.metadata,
